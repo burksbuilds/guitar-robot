@@ -75,10 +75,13 @@ def yield_barres_of_fret(fret, string_map, fret_map):
         #print(f"BARRE ZONE f{fret} {barre_zone}")
         if barre_zone[0] == barre_zone[1]:
             continue
-        for end_finger in range(barre_zone[1],barre_zone[0]):
-            for start_finger in range(end_finger+1,barre_zone[0]+1):
-                #print(f"  SUB ZONE f{fret} {(start_finger, end_finger)}")
-                yield (start_finger,end_finger)
+        for end_string in range(barre_zone[1],barre_zone[0]):
+            for start_string in range(end_string+1,barre_zone[0]+1):
+                for string in fret_map[fret]:
+                    if string <= start_string and string >= end_string:
+                        #print(f"  SUB ZONE f{fret} {(start_string, end_string)}")
+                        yield (start_string,end_string)
+                        break;
 
             
 def yield_fret_groupings_of_fret(fret, string_map, fret_map):
@@ -113,7 +116,7 @@ def yield_fret_grouping_fingerings_recursive(fret_groupings, fingers):
         return
     
     for finger_orders in itertools.permutations(fingers, num_fret_groupings):
-        yield {fingers[finger_orders[i]]:fret_groupings[i] for i in range(num_fret_groupings)}
+        yield {finger_orders[i]:fret_groupings[i] for i in range(num_fret_groupings)}
 
 def is_valid_base_fingering(fingering, positions):
     if 1 in fingering and 2 in fingering and fingering[1][0] > fingering[2][0]:
@@ -183,7 +186,7 @@ def yield_fingerings(positions):
     all_potential_fret_groupings = list(yield_fret_grouping_cases_recursive(0, string_map, fret_map))
     for fret_groupings in all_potential_fret_groupings:
         #print(f"  Potential Fret Grouping: {fret_groupings}")
-        for fingering in yield_fret_grouping_fingerings_recursive(fret_groupings,range(0,len(finger_names))):
+        for fingering in yield_fret_grouping_fingerings_recursive(fret_groupings,range(1,len(finger_names))):
             if is_valid_base_fingering(fingering, positions):
                 yield fingering
     
@@ -356,6 +359,7 @@ reach_configs['f2_m3_r4_p6'].max_accessible_string[2] = 3
 reach_configs['f2_m3_r4_p6'].max_accessible_string[3] = 4
 reach_configs['f2_m3_r4_p6'].min_accessible_string[1] = 2
 
+
 reach_configs['f3_m3_r4_p6'] = ReachConfig()
 reach_configs['f3_m3_r4_p6'].max_accessible_string[2] = 3
 reach_configs['f3_m3_r4_p6'].max_accessible_string[3] = 4
@@ -377,12 +381,14 @@ num_positions = 0
 for chord in chords_json:
     num_positions += len(chords_json[chord])
 
+target_position = None
 
 i_position = 0
 for chord in chords_json:
     for chord_position in chords_json[chord]:
-        position_fingerings = list(yield_fingerings(chord_position['positions']))
         i_position += 1
+        if target_position is not None and i_position != target_position: continue
+        position_fingerings = list(yield_fingerings(chord_position['positions']))
         for config in barre_configs:
             valid_fingering_count = 0
             for fingering in position_fingerings:
@@ -402,9 +408,11 @@ for chord in chords_json:
             for fingering in position_fingerings:
                 if is_valid_fingering(fingering, chord_position['positions'], reach_configs[config]):
                     valid_fingering_count += 1
+                    #print(f"    {fingering}")
             reach_file.write(f"{config};{chord};{chord_position['positions']};{valid_fingering_count}\n")
             print(f"{100*i_position/num_positions:6.1f}%\t{valid_fingering_count}\t{config}\t\t{chord}\t\t{chord_position['positions']}")
-
+        
+    
     
 barre_file.close()
 overlap_file.close()
