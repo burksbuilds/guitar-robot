@@ -7,7 +7,6 @@ Created on Wed Mar 15 09:49:33 2023
 import math
 import itertools
 import operator
-import networkx as nx
 import heapq as hq
 
 POINTER = 1
@@ -43,19 +42,23 @@ class InstrumentConfig(object):
 class FingeringGeneratorConfig(object):
     def __init__(self, instrument_config):
         self.instrument_config = instrument_config
-        self.min_accessible_string = [1,2,1,1,1,1] #indexed by finger actuator
-        self.max_accessible_string = [6,6,3,4,6,6] #indexed by finger actuator
-        self.max_accessible_fret = [0,16,16,20,20,16]
-        self.body_fret_offset = [0,0,1,0,1,0] #the body of the finger is offset this many frets, blocking notes on adjacent frets
+        self.min_accessible_string =   FingeringGeneratorConfig.get_finger_dict(2,1,1,1,1) #indexed by finger actuator
+        self.max_accessible_string =   FingeringGeneratorConfig.get_finger_dict(6,6,6,6,6) #indexed by finger actuator
+        self.max_accessible_fret =     FingeringGeneratorConfig.get_finger_dict(20,20,24,24,16)
+        self.body_fret_offset =        FingeringGeneratorConfig.get_finger_dict(0,1,0,1,0) #the body of the finger is offset this many frets, blocking notes on adjacent frets
         self.allow_barre_crossing = False
         self.force_primary_low = POINTER
         self.force_primary_spacing = 1
-        self.max_adjacent_strings =  [6,2,2,1,1,6]
-        self.min_adjacent_strings =  [1,1,1,1,1,6]
-        self.finger_restrictions = {POINTER:[(MIDDLE,operator.le)], MIDDLE:[(POINTER,operator.ge)],RING:[(PINKY,operator.le)],PINKY:[(RING,operator.ge)], BARRE:[(POINTER,operator.lt),(RING,operator.lt)]} #Assert(val[1](a=key,b=val[0]))
-        self.idle_fingering = {POINTER:FingerPosition(1), MIDDLE:FingerPosition(2), RING:FingerPosition(3), PINKY:FingerPosition(4),BARRE:FingerPosition(0)}
+        self.max_adjacent_strings =  FingeringGeneratorConfig.get_finger_dict(2,2,1,1,6)
+        self.min_adjacent_strings =  FingeringGeneratorConfig.get_finger_dict(1,1,1,1,6)
+        self.finger_restrictions = FingeringGeneratorConfig.get_finger_dict([(MIDDLE,operator.le)], [(POINTER,operator.ge),(PINKY,operator.le)],[(PINKY,operator.le)],[(RING,operator.ge),(MIDDLE,operator.ge)], [(POINTER,operator.lt),(RING,operator.lt)]) #Assert(val[1](a=key,b=val[0]))
+        self.idle_fingering = FingeringGeneratorConfig.get_finger_dict(FingerPosition(1), FingerPosition(2), FingerPosition(3), FingerPosition(4),FingerPosition(0))
         self.note_fingering_duration_ratio = 0.8 #how much of note duration is spend with it being fingered
-        self.cost_held_unplayed_string = 10
+        self.cost_held_unplayed_string = 100
+        self.finger_acceleration_cost_multiplier = FingeringGeneratorConfig.get_finger_dict( 2, 2, 1, 1, 1)
+        
+    def get_finger_dict(pointer,middle,ring,pinky,barre):
+        return {POINTER:pointer, MIDDLE:middle, RING:ring, PINKY:pinky, BARRE:barre}
 
         
 #indicates what strings should be fretted and played for a given beat/note
@@ -88,7 +91,7 @@ class FingerPosition(object):
         return f"({self.fret:2}, {self.strings})"
     __str__ = __repr__
     def get_fingering_string(self, num_strings):
-        out = f"{self.fret:2}:"
+        out = f"{self.fret:2}: "
         for s in range(num_strings,0,-1):
             if s in self.strings:
                 out += f"{s}"
@@ -98,10 +101,11 @@ class FingerPosition(object):
         
         
 class FingeringNode(object):
-    def __init__(self,time,fingering,positions):
+    def __init__(self,time,duration,fingering,positions):
         self.fingering = fingering
         self.positions = positions
         self.time = time #not duration. this is when the fingering happens
+        self.duration = duration
         
         #used in astart search:
         self.previous_node = None
@@ -111,11 +115,12 @@ class FingeringNode(object):
     def get_cost(self):
         prev_cost = self.previous_node.cumulative_cost if self.previous_node is not None else 0
         return self.cumulative_cost - prev_cost
+    
         
     def __eq__(self, o):
         if o is None:
             return False
-        return o.fingering == self.fingering and o.time == self.time and o.cumulative_cost == self.cumulative_cost
+        return o.fingering == self.fingering and o.time == self.time and o.cumulative_cost == self.cumulative_cost and o.duration == self.duration and o.position_index == self.position_index
 
     def __hash__(self):
         return hash(self.__str__())
@@ -123,19 +128,20 @@ class FingeringNode(object):
     def __repr__(self):
         return f"({self.time},{self.positions.__repr__()},{self.fingering.__repr__()})"
     
-    def __str__(self):
-        return self.get_node_cost_string(self.get_cost())
+    __str__ = __repr__
     
-    def get_fingering_string(self):
+    def get_fingering_string(self, num_strings):
         sorted_fingering = list(self.fingering.items())
         sorted_fingering.sort(key=lambda f: (f[1].fret,f[0]))
         out = "/".join(str(f[0]) for f in sorted_fingering)
         for f in self.fingering.items():
-            out += f"   |{f[0]}-"+f[1].get_fingering_string(max(self.fingering.keys()))  
+            out += f"   |{f[0]}-"+f[1].get_fingering_string(num_strings)  
         return out
 
-    def get_node_cost_string(self, cost):
-        return f"t={self.time:6f}: {self.positions.get_tab_string(max(self.fingering.keys()))}\t{self.get_fingering_string()}\t${cost:6.0f}"
+    def get_node_cost_string(self, generator):
+        cost = generator.get_node_transition_cost(self.previous_node, self) if self.previous_node is not None else 0
+        accelerations = generator.get_node_transition_accelerations(self.previous_node, self) if self.previous_node is not None else {0:0}
+        return f"t={self.time:6f}: {self.positions.get_tab_string(len(generator.config.instrument_config.strings))}\t{self.get_fingering_string(len(generator.config.instrument_config.strings))}\t${cost:6.0f}\ta={max(accelerations.values())/386:3.2f}g"
     
     def __lt__(self, other):
         return self.cumulative_cost < other.cumulative_cost
@@ -200,21 +206,6 @@ class FingeringGenerator(object):
             
             
     def __is_valid_fingering(self,fingering):
-        #verify finger order along fret
-        """
-        if POINTER in fingering and MIDDLE in fingering and fingering[POINTER].fret > fingering[MIDDLE].fret:
-            #print(f"  ! Failed because index finger (#1) is at a higher fret {fingering[1][0]} than the middle finger (#2) {fingering[2][0]}")
-            return False
-        if RING in fingering and PINKY in fingering and fingering[RING].fret > fingering[PINKY].fret:
-            #print(f"  ! Failed because ring finger (#3) is at a higher fret {fingering[3][0]} than the pinky finger (#4) {fingering[4][0]}")
-            return False
-        if BARRE in fingering:
-            for finger in fingering:
-                if finger != BARRE and fingering[finger].fret == fingering[BARRE].fret:
-                    #print(f"  ! Failed because barre finger (#5) is at the same fret {fingering[5][0]} as the {finger_names[finger]} finger (#{finger}) {fingering[finger][0]}")
-                    return False
-                """
-                
         
         for finger in fingering:
             #apply finger order constraints
@@ -306,9 +297,14 @@ class FingeringGenerator(object):
             #if finger in COMPLEMENTARY_FINGERS and COMPLEMENTARY_FINGERS[finger] in active_fingering:
                 #yield int((active_fingering[COMPLEMENTARY_FINGERS[finger]].fret + fret)/2)
         #if not reference_frets_of_finger:
-        if finger in COMPLEMENTARY_FINGERS and COMPLEMENTARY_FINGERS[finger] in active_fingering:
-            yield active_fingering[COMPLEMENTARY_FINGERS[finger]].fret
-            
+        #if finger in COMPLEMENTARY_FINGERS and COMPLEMENTARY_FINGERS[finger] in active_fingering:
+            #yield active_fingering[COMPLEMENTARY_FINGERS[finger]].fret
+        if active_fingering:
+            if finger == BARRE:
+                yield min(active_fingering.keys())-1
+            else:
+                for active_finger in active_fingering:
+                    yield active_fingering[active_finger].fret
         else:
             yield self.config.idle_fingering[finger].fret
                 
@@ -353,20 +349,44 @@ class FingeringGenerator(object):
             return self.config.instrument_config.get_fret_transition_distance(max(end_frets), min(start_frets))
         return 0
         
+    
+    def __get_finger_transition_acceleration(self, start_fret, end_fret, time):
+        distance = self.config.instrument_config.get_fret_transition_distance(start_fret, end_fret)
+        if time <= 0: 
+            return float('inf')
+        return 2 * distance / (time * time)
+    
+    def __get_finger_transition_time(self, start_finger_position_strings, start_time, duration, end_time):
+        true_start_time = start_time if not start_finger_position_strings else start_time + duration * self.config.note_fingering_duration_ratio
+        return abs(end_time - true_start_time)
+    
+    def __get_node_transition_time_of_finger(self, finger, start_node, end_node):
+        return self.__get_finger_transition_time(start_node.fingering[finger].strings, start_node.time, start_node.duration, end_node.time)
 
-    def __get_finger_transition_cost(self, finger, start_fingering, end_fingering, start_time, end_time):
+
+    def __get_finger_position_transition_cost(self, finger, start_finger_position, end_finger_position, time):
+        acceleration = self.__get_finger_transition_acceleration(start_finger_position.fret, end_finger_position.fret, time)
+        return acceleration * self.config.finger_acceleration_cost_multiplier[finger]
+
+    def __get_finger_transition_cost(self, finger, start_fingering, end_fingering, time):
         #distance = self.__get_smallest_possible_distance(finger, start_node.fingering, end_node.fingering)
         if finger not in start_fingering or finger not in end_fingering:
             return 0
-        time = abs(end_time - start_time) if not start_fingering[finger].strings else abs(end_time - start_time)*(1-self.config.note_fingering_duration_ratio)
-        distance = self.config.instrument_config.get_fret_transition_distance(start_fingering[finger].fret, end_fingering[finger].fret)
-        if time <= 0: 
-            return float('inf')
-        cost = distance * math.sqrt(distance) / (time * time)
-        return cost
+        return self.__get_finger_position_transition_cost(finger,start_fingering[finger], end_fingering[finger], time)
         
+    #find earliest node where this finger was on the same fret and not playing a string
+    def __get_previous_fingered_node(self, node, finger):
+        current_node = node
+        if finger in current_node.fingering and current_node.fingering[finger].strings:
+            return current_node
+        while (current_node.previous_node is not None) and (finger in current_node.previous_node.fingering) and not(current_node.previous_node.fingering[finger].strings) and current_node.fingering[finger].fret == current_node.previous_node.fingering[finger].fret:
+            current_node = current_node.previous_node
+        return current_node
         
-
+    def __get_node_transition_cost_of_finger(self, finger, start_node, end_node):
+        previous_fingered_node = self.__get_previous_fingered_node(start_node, finger)
+        time = self.__get_node_transition_time_of_finger(finger, previous_fingered_node, end_node)
+        return self.__get_finger_transition_cost(finger, start_node.fingering, end_node.fingering, time)
         
     def __get_fingering_cost(self,fingering, positions):
         cost = 0
@@ -379,9 +399,14 @@ class FingeringGenerator(object):
         return self.__get_fingering_cost(node.fingering, node.positions)
     
         
-    def get_node_transition_cost(self, start_node, end_node, edge_attributes):
+    def get_node_transition_cost(self, start_node, end_node):
         #do i just use the max? or average? or sum? or product?
-        return self.__get_node_cost(end_node) + max(self.__get_finger_transition_cost(finger, start_node.fingering, end_node.fingering, start_node.time, end_node.time) for finger in FINGERS)
+        return self.__get_node_cost(start_node) + self.__get_node_cost(end_node) + sum(self.__get_node_transition_cost_of_finger(finger, start_node, end_node) for finger in FINGERS)
+
+    def get_node_transition_accelerations(self, start_node, end_node):
+        start_nodes = {f:self.__get_previous_fingered_node(start_node, f) for f in start_node.fingering.keys()}
+        return {finger:self.__get_finger_transition_acceleration(start_nodes[finger].fingering[finger].fret, end_node.fingering[finger].fret, self.__get_finger_transition_time(start_nodes[finger].fingering[finger].strings, start_nodes[finger].time, start_nodes[finger].duration, end_node.time)) for finger in start_node.fingering}
+
 
     def __can_transition(self, start_node, end_node):
         #for finger in end_node.fingering:
@@ -391,38 +416,45 @@ class FingeringGenerator(object):
     
 
     
-    def __get_lowest_transition_cost(self, start_positions, end_positions, start_time, end_time):
+    def __get_lowest_transition_cost(self, start_positions, end_positions, start_time, duration, end_time):
         min_cost = None
         for start_fingering in self.yield_active_fingerings(start_positions, self.config.instrument_config.fingers):
+            start_fingering_cost = self.__get_fingering_cost(start_fingering, start_positions)
             for end_fingering in self.yield_active_fingerings(end_positions, self.config.instrument_config.fingers):
-                test_min_cost = min(self.__get_finger_transition_cost(f,start_fingering, end_fingering, start_time, end_time) for f in end_fingering.keys())
+                end_fingering_cost = self.__get_fingering_cost(end_fingering, end_positions)
+                transition_cost = sum(self.__get_finger_transition_cost(f,start_fingering, end_fingering,self.__get_finger_transition_time(start_fingering[f] if f in start_fingering else [], start_time, duration, end_time)) for f in end_fingering.keys()) if end_fingering else 0
+                test_min_cost = start_fingering_cost + end_fingering_cost + transition_cost
                 if min_cost is None or min_cost > test_min_cost:
                     min_cost = test_min_cost
+                    #print(f"{test_min_cost:4.0f}: {start_fingering_cost:4.0f}, {transition_cost:4.0f}, {end_fingering_cost:4.0f}")
                 if min_cost == 0:
+                    
                     break
             if min_cost == 0:
                 break
+        #print(f"{start_fingering} -> {end_fingering}")
         return min_cost
+    
+    def get_lowest_transition_cost(self, start_positions, end_positions, start_time, duration, end_time):
+        return self.__get_lowest_transition_cost(start_positions, end_positions, start_time, duration, end_time)
                 
     
-    def get_fingering_sequence_from_position_sequence(self, start_node, position_sequence, timing):
+    def get_fingering_sequence_from_timed_position_sequence(self, start_node, position_sequence, times, durations):     
         
-        if not timing is list:
-            timing = [beat*timing + start_node.time for beat in range(1,len(position_sequence)+1)]
+
         
-        #setup 'heuristic': estimated cost to destination from a given node. important not to overshoot because its hard to update node sin astar queue
+        #setup 'heuristic': estimated cost to destination from a given node. important not to overshoot because its impossible to update nodes in astar queue
         position_heuristic_lookup = []
         heuristic_cost = 0
         for i in range(len(position_sequence),0,-1):
             if i < len(position_sequence):
-                heuristic_cost += self.__get_lowest_transition_cost(position_sequence[i-1], position_sequence[i], timing[i-1], timing[i])
+                heuristic_cost += self.__get_lowest_transition_cost(position_sequence[i-1], position_sequence[i], times[i-1], durations[i-1], times[i])
             position_heuristic_lookup.insert(0,heuristic_cost)
-        
+        #print(position_heuristic_lookup)
         open_nodes = []
         closed_nodes = dict()
         start_node.positions_index = -1
         start_node.cumulative_cost = 0
-        start_node.previous_node = None
         end_positions_index = len(position_sequence)-1
         
         hq.heappush(open_nodes, (0,start_node))
@@ -435,33 +467,44 @@ class FingeringGenerator(object):
                 while current_node.positions_index >= 0:
                     path.insert(0,current_node)
                     current_node = current_node.previous_node
-                print(f"Found solution after {iteration} iterations")
+                #print(f"Found solution after {iteration} iterations")
                 return path
             
             closed_nodes[current_node.__repr__()]=current_node
             next_position_index = current_node.positions_index+1
             #generate all potential child nodes at next position
             for fingering in self.yield_full_fingerings(position_sequence[next_position_index], FINGERS, [current_node.fingering]):
-                next_node = FingeringNode(timing[next_position_index],fingering,position_sequence[next_position_index])
-                next_node_transition_cost = self.get_node_transition_cost(current_node, next_node, None)
+                #if next_position_index >= 5:
+                    #print(fingering)
+                next_node = FingeringNode(times[next_position_index],durations[next_position_index],fingering,position_sequence[next_position_index])
+                next_node_transition_cost = self.get_node_transition_cost(current_node, next_node)
                 next_node.cumulative_cost = current_node.cumulative_cost + next_node_transition_cost
                 if not next_node.__repr__() in closed_nodes or closed_nodes[next_node.__repr__()].cumulative_cost > next_node.cumulative_cost:
                     next_node.previous_node = current_node
                     next_node.positions_index = next_position_index
                     total_path_estimate = position_heuristic_lookup[next_position_index] + next_node.cumulative_cost
+                    #print(f"{iteration:6}\t\tDepth={current_node.positions_index:2}\t\t Current Best Cost: {current_node.cumulative_cost:6.0f}\t\tChild Cost: {next_node.cumulative_cost:6.0f}")
                     hq.heappush(open_nodes, (total_path_estimate, next_node))
                     
         print("NO SOLUTION FOUND TO POSITION SEQUENCE")
         
+    def get_fingering_sequence_from_timed_beats(self, start_node, timed_beats):
+        position_sequence = [StringPositions(tb.get_string_map()) for tb in timed_beats]
+        times = [tb.time for tb in timed_beats]
+        durations = [tb.get_duration() for tb in timed_beats]
+        return self.get_fingering_sequence_from_timed_position_sequence(start_node, position_sequence, times, durations)
 
     
     
-    
-    
+"""    
 instrument_config = InstrumentConfig.SixStringBarreSetup()
 generator_config = FingeringGeneratorConfig(instrument_config)
 fingering_generator = FingeringGenerator(generator_config)
-    
+start_positions = StringPositions.from_chord_list(['x','3','3','2','1','1'])
+end_positions = StringPositions.from_chord_list(['x','0','1','0','2','3'])
+print(fingering_generator.get_lowest_transition_cost(start_positions, end_positions, 0, 0.3, 0.3))
+
+
 beat_duration = 1 / (180*4/60) #BPM * size_of_beat / to_seconds  <-invert
 
 beats = [
@@ -491,12 +534,13 @@ beats = [
     ['x','x','9','x','x','x']]
 
 beat_positions = [StringPositions.from_chord_list(b) for b in beats]
-start_node = FingeringNode(0,generator_config.idle_fingering,StringPositions({}))
+start_node = FingeringNode(0,beat_duration*4,generator_config.idle_fingering,StringPositions({}))
 
 fingering_sequence = fingering_generator.get_fingering_sequence_from_position_sequence(start_node, beat_positions, beat_duration)
 
 
-print(start_node)
+print(start_node.get_node_cost_string(fingering_generator))
 for i,node in enumerate(fingering_sequence):
-    print(node)
+    print(node.get_node_cost_string(fingering_generator))
 print(f"cost: {fingering_sequence[-1].cumulative_cost}")
+"""
